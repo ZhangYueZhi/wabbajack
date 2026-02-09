@@ -1,25 +1,17 @@
 #!/usr/bin/env python3
-"""Analyze a Wabbajack modlist recipe inside a .wabbajack archive or extracted modlist JSON.
-
-Features:
-- Loads modlist from:
-  1) .wabbajack zip (entry: modlist or modlist.json), or
-  2) direct modlist JSON file.
-- Summarizes directives by type.
-- Finds inlined payload references (e.g. SourceDataID, PatchID, TempID).
-- If input is .wabbajack, cross-checks referenced IDs vs zip entries.
-"""
+"""Analyze a Wabbajack modlist recipe inside a .wabbajack archive or extracted modlist JSON."""
 
 from __future__ import annotations
 
 import argparse
 import json
+import string
 import sys
+import uuid
 import zipfile
-from collections import Counter
+from collections import Counter, defaultdict
 from pathlib import Path
 from typing import Any, Iterable
-
 
 MODLIST_ENTRY_CANDIDATES = ("modlist", "modlist.json")
 IGNORED_ZIP_ENTRIES = {"modlist", "modlist.json", "modlist-image.png"}
@@ -50,7 +42,6 @@ def load_modlist(path: Path) -> tuple[dict[str, Any], set[str] | None]:
 def directive_type(d: dict[str, Any]) -> str:
     t = d.get("$type") or d.get("Type") or "Unknown"
     if isinstance(t, str):
-        # Legacy format can be "InlineFile, Wabbajack.Lib"
         return t.split(",", 1)[0].strip()
     return str(t)
 
@@ -61,7 +52,6 @@ def normalize_relpath(v: Any) -> str | None:
     if isinstance(v, str):
         return v
     if isinstance(v, dict):
-        # Fallbacks for converter shapes
         for k in ("Path", "Value", "path", "value"):
             if k in v and isinstance(v[k], str):
                 return v[k]
@@ -79,6 +69,19 @@ def collect_ids(directives: Iterable[dict[str, Any]]) -> dict[str, set[str]]:
     return found
 
 
+def collect_id_usages(directives: Iterable[dict[str, Any]]) -> dict[str, list[tuple[str, str, str]]]:
+    usages: dict[str, list[tuple[str, str, str]]] = defaultdict(list)
+    for d in directives:
+        dt = directive_type(d)
+        to_path = normalize_relpath(d.get("To")) or "<no To>"
+        for k in ID_FIELDS:
+            if k in d:
+                rid = normalize_relpath(d[k])
+                if rid:
+                    usages[rid].append((k, dt, to_path))
+    return usages
+
+
 def fmt_top(counter: Counter[str], top_n: int = 20) -> str:
     lines = []
     for name, count in counter.most_common(top_n):
@@ -88,11 +91,80 @@ def fmt_top(counter: Counter[str], top_n: int = 20) -> str:
     return "\n".join(lines) if lines else "  (none)"
 
 
+def is_guid_like(name: str) -> bool:
+    try:
+        uuid.UUID(name)
+        return True
+    except ValueError:
+        return False
+
+
+def sniff_payload(data: bytes) -> tuple[str, str]:
+    if not data:
+        return "empty", ""
+
+    if data.startswith(b"PK\x03\x04"):
+        return "zip", "nested zip container"
+    if data[:2] == b"MZ":
+        return "pe", "Windows executable/library header"
+    if data[:8] == b"\x89PNG\r\n\x1a\n":
+        return "png", "PNG image"
+
+    sample = data[:2048]
+    printable = set(string.printable.encode("ascii"))
+    ratio = sum(1 for b in sample if b in printable) / len(sample)
+    if ratio > 0.95:
+        try:
+            txt = sample.decode("utf-8")
+            preview = txt[:160].replace("\n", "\\n")
+            return "text", preview
+        except UnicodeDecodeError:
+            pass
+
+    return "binary", "non-text payload"
+
+
+def analyze_guid_payloads(path: Path, id_usages: dict[str, list[tuple[str, str, str]]], limit: int) -> None:
+    print("\n=== GUID Payload Analysis ===")
+    with zipfile.ZipFile(path, "r") as zf:
+        entries = [i for i in zf.infolist() if not i.is_dir()]
+        guid_entries = [e for e in entries if is_guid_like(e.filename)]
+
+        print(f"GUID-like entries in archive: {len(guid_entries)}")
+
+        shown = 0
+        for e in sorted(guid_entries, key=lambda x: x.filename):
+            if shown >= limit:
+                break
+            with zf.open(e.filename, "r") as fp:
+                data = fp.read(min(e.file_size, 8192))
+
+            kind, detail = sniff_payload(data)
+            usages = id_usages.get(e.filename, [])
+            print(f"\n- {e.filename}")
+            print(f"  size: {e.file_size} bytes")
+            print(f"  inferred payload: {kind}{f' ({detail})' if detail else ''}")
+            if usages:
+                print(f"  usages: {len(usages)}")
+                for field, dtype, to in usages[:5]:
+                    print(f"    - field={field}, directive={dtype}, to={to}")
+                if len(usages) > 5:
+                    print(f"    ... ({len(usages) - 5} more)")
+            else:
+                print("  usages: 0 (orphan GUID entry)")
+            shown += 1
+
+        if len(guid_entries) > limit:
+            print(f"\n... truncated: showing {limit}/{len(guid_entries)} GUID entries")
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="Analyze Wabbajack modlist recipe")
     parser.add_argument("input", type=Path, help="Path to .wabbajack or modlist/modlist.json")
     parser.add_argument("--show-missing", action="store_true", help="Print referenced IDs missing from zip")
     parser.add_argument("--show-orphan", action="store_true", help="Print zip entries that are not referenced")
+    parser.add_argument("--analyze-guid", action="store_true", help="Inspect GUID payload files inside .wabbajack")
+    parser.add_argument("--guid-limit", type=int, default=20, help="Max GUID entries to print (default: 20)")
     args = parser.parse_args()
 
     if not args.input.exists():
@@ -115,8 +187,10 @@ def main() -> int:
         print("Invalid modlist: Archives is not a list", file=sys.stderr)
         return 1
 
-    d_counter = Counter(directive_type(d) for d in directives if isinstance(d, dict))
-    ids = collect_ids([d for d in directives if isinstance(d, dict)])
+    dict_directives = [d for d in directives if isinstance(d, dict)]
+    d_counter = Counter(directive_type(d) for d in dict_directives)
+    ids = collect_ids(dict_directives)
+    id_usages = collect_id_usages(dict_directives)
     all_ids = set().union(*ids.values()) if ids else set()
 
     print("=== Modlist Recipe Summary ===")
@@ -153,6 +227,12 @@ def main() -> int:
             print("\nOrphan data entries:")
             for x in orphan:
                 print(f"  - {x}")
+
+    if args.analyze_guid:
+        if args.input.suffix.lower() != ".wabbajack":
+            print("\n--analyze-guid requires .wabbajack input", file=sys.stderr)
+            return 2
+        analyze_guid_payloads(args.input, id_usages, max(1, args.guid_limit))
 
     return 0
 
