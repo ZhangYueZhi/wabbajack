@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Analyze a Wabbajack modlist recipe inside a .wabbajack archive or extracted modlist JSON."""
+"""Analyze a Wabbajack modlist recipe and generate detailed source-operation reports."""
 
 from __future__ import annotations
 
@@ -124,6 +124,110 @@ def sniff_payload(data: bytes) -> tuple[str, str]:
     return "binary", "non-text payload"
 
 
+def parse_archive_hash_path(v: Any) -> tuple[str | None, list[str]]:
+    """Support legacy compact list format and object format."""
+    if isinstance(v, list) and v:
+        return str(v[0]), [str(p) for p in v[1:]]
+    if isinstance(v, dict):
+        h = v.get("Hash")
+        parts = v.get("Parts")
+        if h is not None and isinstance(parts, list):
+            return str(h), [str(p) for p in parts]
+    return None, []
+
+
+def operation_desc(d: dict[str, Any], d_type: str) -> str:
+    if d_type == "FromArchive":
+        return "extract file from archive"
+    if d_type == "PatchedFromArchive":
+        patch_id = normalize_relpath(d.get("PatchID")) or "<unknown patch>"
+        return f"extract then apply binary patch ({patch_id})"
+    if d_type == "TransformedTexture":
+        state = d.get("ImageState")
+        if state is not None:
+            return f"extract then transform texture ({json.dumps(state, ensure_ascii=False, separators=(',', ':'))})"
+        return "extract then transform texture"
+    return d_type
+
+
+def generate_detailed_report(modlist: dict[str, Any], out_file: Path) -> None:
+    directives = [d for d in (modlist.get("Directives") or []) if isinstance(d, dict)]
+    archives = [a for a in (modlist.get("Archives") or []) if isinstance(a, dict)]
+
+    archive_meta: dict[str, dict[str, Any]] = {}
+    for a in archives:
+        h = a.get("Hash")
+        if h is not None:
+            archive_meta[str(h)] = a
+
+    grouped: dict[str, list[dict[str, str]]] = defaultdict(list)
+
+    for d in directives:
+        d_type = directive_type(d)
+        if "ArchiveHashPath" not in d:
+            continue
+
+        h, parts = parse_archive_hash_path(d.get("ArchiveHashPath"))
+        if h is None:
+            continue
+
+        source_in_archive = "\\".join(parts) if parts else "<archive-root>"
+        to_path = normalize_relpath(d.get("To")) or "<no To>"
+        op = operation_desc(d, d_type)
+
+        arch = archive_meta.get(h, {})
+        archive_name = str(arch.get("Name") or f"<unknown archive {h}>")
+
+        state = arch.get("State")
+        state_type = ""
+        if isinstance(state, dict):
+            state_type = str(state.get("$type") or state.get("Type") or "")
+            if state_type:
+                state_type = state_type.split(",", 1)[0].strip()
+
+        mod_key = archive_name
+        grouped[mod_key].append(
+            {
+                "archive_hash": h,
+                "archive_state": state_type or "UnknownState",
+                "directive": d_type,
+                "source": source_in_archive,
+                "to": to_path,
+                "operation": op,
+            }
+        )
+
+    with out_file.open("w", encoding="utf-8") as f:
+        f.write("# Wabbajack Detailed Recipe Report\n\n")
+        f.write(f"- Name: {modlist.get('Name', '<unknown>')}\n")
+        f.write(f"- GameType: {modlist.get('GameType', '<unknown>')}\n")
+        f.write(f"- WabbajackVersion: {modlist.get('WabbajackVersion', '<unknown>')}\n")
+        f.write(f"- Archive groups (mods): {len(grouped)}\n")
+        total_rows = sum(len(v) for v in grouped.values())
+        f.write(f"- File operations from archives: {total_rows}\n\n")
+
+        for mod_name in sorted(grouped.keys()):
+            rows = grouped[mod_name]
+            counter = Counter(r["directive"] for r in rows)
+            first = rows[0]
+            f.write(f"## {mod_name}\n\n")
+            f.write(f"- Archive hash: `{first['archive_hash']}`\n")
+            f.write(f"- Archive state: `{first['archive_state']}`\n")
+            f.write(f"- Operation count: {len(rows)}\n")
+            f.write("- Directive breakdown:\n")
+            for k, c in counter.most_common():
+                f.write(f"  - {k}: {c}\n")
+            f.write("\n")
+            f.write("| Directive | Source In Archive | Destination | Operation |\n")
+            f.write("|---|---|---|---|\n")
+            for r in rows:
+                src = r["source"].replace("|", "\\|")
+                dst = r["to"].replace("|", "\\|")
+                op = r["operation"].replace("|", "\\|")
+                f.write(f"| {r['directive']} | `{src}` | `{dst}` | {op} |\n")
+            f.write("\n")
+
+
 def analyze_guid_payloads(path: Path, id_usages: dict[str, list[tuple[str, str, str]]], limit: int) -> None:
     print("\n=== GUID Payload Analysis ===")
     with zipfile.ZipFile(path, "r") as zf:
@@ -165,6 +269,11 @@ def main() -> int:
     parser.add_argument("--show-orphan", action="store_true", help="Print zip entries that are not referenced")
     parser.add_argument("--analyze-guid", action="store_true", help="Inspect GUID payload files inside .wabbajack")
     parser.add_argument("--guid-limit", type=int, default=20, help="Max GUID entries to print (default: 20)")
+    parser.add_argument(
+        "--detailed-report-out",
+        type=Path,
+        help="Write detailed markdown report: which destination file comes from which archive and operation",
+    )
     args = parser.parse_args()
 
     if not args.input.exists():
@@ -233,6 +342,11 @@ def main() -> int:
             print("\n--analyze-guid requires .wabbajack input", file=sys.stderr)
             return 2
         analyze_guid_payloads(args.input, id_usages, max(1, args.guid_limit))
+
+    if args.detailed_report_out is not None:
+        args.detailed_report_out.parent.mkdir(parents=True, exist_ok=True)
+        generate_detailed_report(modlist, args.detailed_report_out)
+        print(f"\nDetailed report written: {args.detailed_report_out}")
 
     return 0
 
